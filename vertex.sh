@@ -2,16 +2,16 @@
 set -Eeuo pipefail
 trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "$LINENO" "$?" >&2' ERR
 
-# ───────────────────────────────── Config (env-overridable)
+# ────── 可用环境变量覆盖的参数 ─────────────────────────────────────────────
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 KEY_DIR="${KEY_DIR:-./keys}"
 MAX_RETRY=${MAX_RETRY:-3}
-CONCURRENCY=${CONCURRENCY:-5}                                 # 并行启用 API 上限
+CONCURRENCY=${CONCURRENCY:-5}                          # 启用 API 的并行上限
 ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
-# ───────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
 
 log() { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
 
@@ -49,8 +49,8 @@ check_env() {
 }
 
 list_open_billing() {
-  gcloud billing accounts list --filter='open=true' --format='value(name,displayName)' |
-    awk '{printf "%s %s\n", $1, substr($0,index($0,$2))}' | sed 's|billingAccounts/||'
+  gcloud billing accounts list --filter='open=true' --format='value(name,displayName)' \
+    | awk '{printf "%s %s\n", $1, substr($0,index($0,$2))}' | sed 's|billingAccounts/||'
 }
 
 choose_billing() {
@@ -94,26 +94,18 @@ create_project() {
   provision_sa "$pid"
 }
 
-# ───────── 并行启用 API（限速）+ 顺序置备 SA/Key ─────────
-process_projects() {
+process_projects() {                        # 并行启用 API + 顺序置备密钥
   local proj pids=() running=0
   for proj in "$@"; do
-    (
-      sleep $((RANDOM%3))
-      enable_services "$proj" aiplatform.googleapis.com
-    ) & pids+=("$!")
-    (( running++ ))
-    if (( running >= CONCURRENCY )); then
-      wait -n  # Bash ≥5
-      (( running-- ))
-    fi
+    ( sleep $((RANDOM%3)); enable_services "$proj" aiplatform.googleapis.com ) & pids+=("$!")
+    (( ++running >= CONCURRENCY )) && { wait -n; ((running--)); }
   done
-  wait  # 等所有启用任务完成
+  wait
   for proj in "$@"; do provision_sa "$proj"; done
 }
 
-list_cloud_keys()   { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
-latest_cloud_key()  { gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)' | sed 's|.*/||'; }
+list_cloud_keys()  { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
+latest_cloud_key() { gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)' | sed 's|.*/||'; }
 
 gen_key() {
   local proj=$1 sa=$2 ts=$(date +%Y%m%d-%H%M%S)
@@ -129,6 +121,7 @@ provision_sa() {
     retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Admin" --project "$proj" --quiet
   local roles=(roles/aiplatform.admin "${ENABLE_EXTRA_ROLES[@]}") r
   for r in "${roles[@]}"; do retry gcloud projects add-iam-policy-binding "$proj" --member="serviceAccount:$sa" --role="$r" --quiet || true; done
+
   local local_keys=("${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-"*.json); [[ -e "${local_keys[0]}" ]] || local_keys=()
   if (( ${#local_keys[@]} )); then
     if ask_yes_no "[$proj] 本地已有密钥 (${#local_keys[@]}). 生成新密钥?" Y; then
@@ -169,19 +162,22 @@ handle_billing() {
   log INFO "使用结算账户: $BILLING_ACCOUNT (已绑定 $count / $MAX_PROJECTS_PER_ACCOUNT 项目)"
   process_projects "${PROJECTS[@]}"
   while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
+  show_status
 }
 
 main() {
   check_env
   mapfile -t ALL_BILLING < <(list_open_billing)
-  printf "请选择模式：\n 1) 单一结算账户  2) 批量处理全部结算账户\n"
-  local mode; mode=$(prompt_choice "输入 1 或 2" "1|2" "1")
-  if [[ $mode == 2 ]]; then
-    for acc in "${ALL_BILLING[@]}"; do handle_billing "${acc%% *}"; done
-    exit 0
+  if (( ${#ALL_BILLING[@]} > 1 )); then
+    local mode; mode=$(prompt_choice "检测到多个 OPEN 结算账户，选择模式：1) 仅处理一个  2) 全部批量" "1|2" "1")
+    if [[ $mode == 2 ]]; then
+      for acc in "${ALL_BILLING[@]}"; do handle_billing "${acc%% *}"; done
+      exit 0
+    fi
   fi
   choose_billing
   handle_billing "$BILLING_ACCOUNT"
 }
 
+prepare_key_dir
 main "$@"
