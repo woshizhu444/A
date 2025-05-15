@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r4)
+# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r5)
 # Creates/rotates up to three Vertex‑ready projects under one billing account.
 
 set -Eeuo pipefail
@@ -11,12 +11,21 @@ PROJECT_PREFIX="vertex"                  # new project id prefix
 MAX_PROJECTS_PER_ACCOUNT=3
 SERVICE_ACCOUNT_NAME="vertex-admin"      # base service account name
 KEY_DIR="./keys"                         # local key store (one JSON per key)
-MAX_RETRY=3
+MAX_RETRY=3                               # gcloud retry attempts
 ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
 # -----------------------------------------------------------------------------
 
 log()          { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
-retry()        { local n=1; until "$@"; do ((n>=MAX_RETRY)) && { log ERROR "失败: $*"; return 1; }; log WARN "重试 $n/$MAX_RETRY: $*"; sleep $((n*4)); ((n++)); done; }
+retry() {
+  local n=1 delay
+  until "$@"; do
+    (( n >= MAX_RETRY )) && { log ERROR "失败: $*"; return 1; }
+    delay=$(( n * 10 + RANDOM % 5 ))
+    log WARN "重试 $n/$MAX_RETRY: $* (等待 ${delay}s)"
+    sleep "$delay"
+    (( n++ ))
+  done
+}
 require_cmd()  { command -v "$1" &>/dev/null || { log ERROR "缺少依赖: $1"; exit 1; }; }
 ask_yes_no()   { local p="$1" d=${2:-N} r; [[ -t 0 ]] && read -r -p "$p [${d}] " r; r=${r:-$d}; [[ $r =~ ^[Yy]$ ]]; }
 
@@ -34,7 +43,16 @@ prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
 
 unique_suffix() { date +%s%N | sha256sum | head -c6; }
 new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
-enable_services() { local p=$1; shift; [[ $# -gt 0 ]] && retry gcloud services enable "$@" --project="$p" --quiet; }
+
+enable_services() {
+  local p=$1 svc; shift
+  for svc in "$@"; do
+    # 跳过已启用服务，减少 Service Usage 429
+    gcloud services list --enabled --project="$p" --filter="$svc" --format='value(config.name)' | grep -q . && continue
+    retry gcloud services enable "$svc" --project="$p" --quiet
+  done
+}
+
 link_billing()   { retry gcloud beta billing projects link "$1" --billing-account="$BILLING_ACCOUNT" --quiet; }
 unlink_billing() { retry gcloud beta billing projects unlink "$1" --quiet; }
 
