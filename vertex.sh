@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # r21 – 恢复 0/1/2/3 菜单，支持多结算账户，修复 proj 变量及密钥删除问题
+# v2 - 修复 gcloud 命令中注释导致参数错误的问题
 
 set -Eeuo pipefail
 trap 'printf "[错误] 在行 %d 中止 (退出码 %d)\n" "$LINENO" "$?" >&2' ERR
@@ -252,7 +253,7 @@ show_status() {
   printf "\n当前项目状态 (结算账户: %s)\n" "$BILLING_ACCOUNT"
   local proj_id api_status key_count_str
   if (( ${#PROJECTS[@]} == 0 )); then
-    printf "  此结算账户下没有通过本脚本管理的项目。\n"
+    printf "  此结算账户下没有通过本脚本管理的项目 (基于项目前缀 '%s-' 过滤)。\n" "$PROJECT_PREFIX"
   fi
   for proj_id in "${PROJECTS[@]}"; do
     # 统计本地密钥数量
@@ -276,9 +277,10 @@ handle_billing() {
   BILLING_ACCOUNT="$1" 
   # 清空并重新加载当前结算账户下的项目列表
   PROJECTS=() 
+  # 仅列出由此脚本创建的项目 (基于 PROJECT_PREFIX 过滤)
   mapfile -t PROJECTS < <(gcloud beta billing projects list \
                             --billing-account="$BILLING_ACCOUNT" \
-                            --filter="projectId:$PROJECT_PREFIX-" \ # 仅列出由此脚本创建的项目
+                            --filter="projectId:$PROJECT_PREFIX-" \
                             --format='value(projectId)')
   prepare_keydir # 确保密钥目录存在
 
@@ -301,8 +303,8 @@ handle_billing() {
         log 信息 "项目检查/补足完成。"
         ;;
       2) # 清空并重建
-        if ask_yes_no "[$BILLING_ACCOUNT] 警告：此操作将解绑并忽略此结算账户下所有由脚本管理的项目，然后重新创建 $MAX_PROJECTS_PER_ACCOUNT 个新项目。确定吗?" N; then
-          log 信息 "正在解绑当前结算账户下的项目..."
+        if ask_yes_no "[$BILLING_ACCOUNT] 警告：此操作将解绑并忽略此结算账户下所有名称以 '${PROJECT_PREFIX}-' 开头的项目，然后重新创建 $MAX_PROJECTS_PER_ACCOUNT 个新项目。确定吗?" N; then
+          log 信息 "正在解绑当前结算账户下的项目 (基于前缀 '${PROJECT_PREFIX}-')..."
           local p_to_unlink
           for p_to_unlink in "${PROJECTS[@]}"; do
             log 信息 "[$BILLING_ACCOUNT] 正在解绑项目: $p_to_unlink"
