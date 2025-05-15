@@ -61,16 +61,23 @@ choose_billing() {
     BILLING_ACCOUNT="${ACCS[0]%% *}"
     return
   fi
-  printf "可用结算账户：\n"
-  local i=0 ; for line in "${ACCS[@]}"; do
-    printf "  %d) %s\n" "$i" "$line"; ((i++));
-  done
-  local sel
-  sel=$(prompt_choice "请选择结算账户编号" "0-$((${#ACCS[@]}-1))" "0")
-  BILLING_ACCOUNT="${ACCS[$sel]%% *}"
-}
 
-prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
+  printf "可用结算账户：
+"
+  local i; for i in "${!ACCS[@]}"; do printf "  %d) %s
+" "$i" "${ACCS[$i]}"; done
+
+  local sel
+  while true; do
+    read -r -p "请输入编号 [0-$((${#ACCS[@]}-1))] (默认 0): " sel
+    sel=${sel:-0}
+    [[ $sel =~ ^[0-9]+$ ]] && (( sel>=0 && sel < ${#ACCS[@]} )) && break
+    echo "无效输入，请重新输入数字。"
+  done
+  BILLING_ACCOUNT="${ACCS[$sel]%% *}"
+}  # choose_billing
+
+prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
 unique_suffix() { date +%s%N | sha256sum | head -c6; }
 new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 
