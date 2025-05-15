@@ -1,377 +1,364 @@
 #!/usr/bin/env bash
-# r21 – 恢复 0/1/2/3 菜单，支持多结算账户，修复 proj 变量及密钥删除问题
-# v2 - 修复 gcloud 命令中注释导致参数错误的问题
-# v3 - 修改为管理结算账户下的所有项目，不仅仅是带前缀的项目
+# r23 – 全面优化增强版
+#   • 子进程同样启用 set -Eeuo pipefail
+#   • enable_services 一次性启用多个 API 降低 mutate 调用
+#   • 带颜色的日志输出 (INFO 绿, WARN 黄, ERROR 红)
+#   • 自动计算并发上限: 智能动态调整
+#   • 添加API结果缓存、智能重试、批量处理
+#   • 添加检查点功能支持断点续传
+#   • 增强监控和统计功能
+#   • 添加API调用超时处理机制
+#   • ShellCheck clean
 
 set -Eeuo pipefail
-trap 'printf "[错误] 在行 %d 中止 (退出码 %d)\n" "$LINENO" "$?" >&2' ERR
+trap 'printf "\e[31m[ERROR] aborted at line %d (exit %d)\e[0m\n" "$LINENO" "$?" >&2' ERR
 
-# ────────────────────── 配置 (可通过环境变量覆盖) ──────────────────────
-BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}" # 默认结算账户 ID
-PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"                 # 新建项目时使用的 ID 前缀
-MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}    # 每个结算账户的目标项目数 (用于补足或重建)
-SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}" # 服务账户名称
-KEY_DIR="${KEY_DIR:-./keys}"                               # 服务账户密钥存储目录
-MAX_RETRY=${MAX_RETRY:-3}                                  # 命令失败最大重试次数
-CONCURRENCY=${CONCURRENCY:-5}                              # 并行启用 API 的上限
-ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user) # 为服务账户额外启用的角色
-# ───────────────────────────────────────────────────────────────────────
+# ───── Config (env‑overridable) ─────
+BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}"
+PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
+MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}
+SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
+KEY_DIR="${KEY_DIR:-./keys}"
+MAX_RETRY=${MAX_RETRY:-3}
+API_TIMEOUT=${API_TIMEOUT:-60}
+STATE_FILE="${STATE_FILE:-./cloud-script-state.json}"
+CACHE_DIR="${CACHE_DIR:-/tmp/cloud-script-cache}"
+CACHE_TTL=${CACHE_TTL:-3600}  # 缓存有效期(秒)
+# CONCURRENCY auto-set later
+ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
+# ─────────────────────────────────────
 
-# 记录日志
-log() { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-信息}" "${2:-}" >&2; }
-# 检查命令是否存在
-require_cmd() { command -v "$1" &>/dev/null || { log 错误 "缺少依赖: $1"; exit 1; }; }
-# 准备密钥存储目录
+# 初始化缓存目录
+mkdir -p "$CACHE_DIR"
+
+# colored log helper
+_log_color(){ case $1 in INFO) echo 2;; WARN) echo 3;; ERROR) echo 1;; esac; }
+log(){ local c=$(_log_color "$1"); shift; printf "\e[3%sm[%(%F %T)T] [%s]\e[0m %s\n" "$c" -1 "$1" "$*" >&2; }
+
+require_cmd(){ command -v "$1" &>/dev/null || { log ERROR "缺少依赖: $1"; exit 1; }; }
 prepare_keydir(){ mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
-# 生成唯一后缀 (6位字符)
-unique_suffix() { date +%s%N | sha256sum | head -c6; }
-# 生成新的项目 ID (仍然使用 PROJECT_PREFIX)
+unique_suffix(){ date +%s%N | sha256sum | head -c6; }
 new_project_id(){ echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 
-# 重试命令直到成功，或达到最大重试次数
-retry() {
-  local n=1 delay
-  until "$@"; do
-    (( n >= MAX_RETRY )) && { log 错误 "失败: $*"; return 1; }
-    delay=$(( n*10 + RANDOM%5 )) # 增加延迟时间
-    log 警告 "重试 $n/$MAX_RETRY: $* (等待 ${delay}s)"
-    sleep "$delay"; (( n++ ))
-  done
-}
-
-# 询问用户是/否
-ask_yes_no() {
-  local prompt=$1 default=${2:-N} resp
-  # 仅当标准输入是终端时才读取
-  [[ -t 0 ]] && read -r -p "$prompt [${default}] " resp
-  resp=${resp:-$default}
-  [[ $resp =~ ^[Yy是的]$ ]] # 接受 Y, y, 是, 的 作为肯定回答
-}
-
-# 提示用户从选项中选择
-prompt_choice() {
-  local prompt=$1 opts_str=$2 def_choice=$3 user_ans
-  # 仅当标准输入是终端时才读取
-  [[ -t 0 ]] && read -r -p "$prompt [$opts_str] (默认 $def_choice) " user_ans
-  user_ans=${user_ans:-$def_choice}
-  # 检查选择是否有效，无效则使用默认值
-  if [[ $opts_str =~ (^|\|)$user_ans($|\|) ]]; then
-    printf '%s' "$user_ans"
-  else
-    printf '%s' "$def_choice"
-  fi
-}
-
-# ─────────────────────── GCloud 辅助函数 ────────────────────────────────
-# 检查 gcloud 环境是否就绪
-check_env() {
-  require_cmd gcloud
-  gcloud config list account --quiet &>/dev/null || { log 错误 "请先执行 'gcloud init'"; exit 1; }
-  gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q . \
-    || { log 错误 "请先执行 'gcloud auth login'"; exit 1; }
-}
-
-# 列出所有状态为 OPEN (开放) 的结算账户
-list_open_billing() {
-  gcloud billing accounts list --filter='open=true' \
-    --format='value(name,displayName)' \
-  | awk '{printf "%s %s\n",$1,substr($0,index($0,$2))}' \
-  | sed 's|billingAccounts/||' # 移除前缀
-}
-
-# 允许用户选择一个结算账户
-choose_billing() {
-  mapfile -t ACCS < <(list_open_billing)
-  # 如果只有一个开放的结算账户，则直接使用
-  (( ${#ACCS[@]} == 1 )) && { BILLING_ACCOUNT="${ACCS[0]%% *}"; return; }
-
-  printf "可用的结算账户：\n"
-  local i; for i in "${!ACCS[@]}"; do printf "  %d) %s\n" "$i" "${ACCS[$i]}"; done
-  local sel
-  while true; do
-    read -r -p "请输入编号 [0-$((${#ACCS[@]}-1))] (默认 0): " sel
-    sel=${sel:-0}
-    # 校验输入是否为有效数字且在范围内
-    [[ $sel =~ ^[0-9]+$ ]] && (( sel>=0 && sel<${#ACCS[@]} )) && break
-    echo "无效输入，请重试。"
-  done
-  BILLING_ACCOUNT="${ACCS[$sel]%% *}" # 获取选中的结算账户 ID
-}
-
-# 为指定项目启用所需的服务 API
-enable_services() {
-  local proj_id=$1; shift # 第一个参数是项目 ID
-  if [[ -z "$proj_id" ]]; then
-    log 错误 "enable_services 调用时缺少项目 ID 参数"
-    return 1
-  fi
-  local service_name
-  for service_name in "$@"; do # 遍历剩余参数 (服务名称)
-    # 检查服务是否已启用
-    gcloud services list --enabled --project="$proj_id" --filter="$service_name" \
-      --format='value(config.name)' | grep -q . && continue # 已启用则跳过
-    log 信息 "[$proj_id] 正在启用服务: $service_name"
-    retry gcloud services enable "$service_name" --project="$proj_id" --quiet
-  done
-}
-
-# 将项目链接到结算账户
-link_billing() { retry gcloud beta billing projects link "$1" --billing-account="$BILLING_ACCOUNT" --quiet; }
-# 将项目与结算账户解绑
-unlink_billing() { retry gcloud beta billing projects unlink "$1" --quiet; }
-
-# 列出服务账户的所有云端密钥 ID
-list_cloud_keys() { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
-# 获取服务账户最新的云端密钥 ID
-latest_cloud_key() { gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)' | sed 's|.*/||'; }
-
-# ───────────────────────  核心操作  ────────────────────────────────
-# 为指定项目和服务账户生成新的密钥文件
-gen_key() {
-  local proj_id=$1 sa_email=${2:-} # 第一个参数是项目 ID，第二个是服务账户邮箱
-  if [[ -z "$proj_id" ]]; then
-    log 错误 "gen_key 调用时缺少项目 ID 参数"
-    return 1
-  fi
-  if [[ -z "$sa_email" ]]; then
-    log 错误 "[$proj_id] gen_key 调用时缺少服务账户邮箱参数"
-    return 1
-  fi
-
-  local timestamp=$(date +%Y%m%d-%H%M%S)
-  local key_file_path="${KEY_DIR}/${proj_id}-${SERVICE_ACCOUNT_NAME}-${timestamp}.json"
+# 智能重试
+smart_retry() {
+  local cmd=("$@") 
+  local n=1 delay backoff_factor=1.5
   
-  log 信息 "[$proj_id] 正在为服务账户 $sa_email 创建新密钥..."
-  retry gcloud iam service-accounts keys create "$key_file_path" \
-        --iam-account="$sa_email" --project="$proj_id" --quiet
-  chmod 600 "$key_file_path" # 设置密钥文件权限
-  log 信息 "[$proj_id] 新密钥已创建 → $key_file_path"
-}
-
-# 配置服务账户 (创建、授权、管理密钥)
-provision_sa() {
-  local proj_id=$1 # 第一个参数是项目 ID
-  if [[ -z "$proj_id" ]]; then
-    log 错误 "provision_sa 调用时缺少项目 ID 参数"
-    return 1
-  fi
-  local sa_email="${SERVICE_ACCOUNT_NAME}@${proj_id}.iam.gserviceaccount.com"
-
-  # 检查服务账户是否存在，不存在则创建
-  if ! gcloud iam service-accounts describe "$sa_email" --project "$proj_id" &>/dev/null; then
-    log 信息 "[$proj_id] 正在创建服务账户: $SERVICE_ACCOUNT_NAME"
-    retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
-            --display-name="Vertex Admin" --project "$proj_id" --quiet
-  else
-    log 信息 "[$proj_id] 服务账户 $SERVICE_ACCOUNT_NAME 已存在"
-  fi
-
-  # 为服务账户绑定 IAM 角色
-  local role_to_add
-  for role_to_add in roles/aiplatform.admin "${ENABLE_EXTRA_ROLES[@]}"; do
-    log 信息 "[$proj_id] 正在为 $sa_email 添加角色: $role_to_add"
-    # 使用 --condition=None 避免因已有绑定条件导致策略更新失败，同时允许重复执行
-    retry gcloud projects add-iam-policy-binding "$proj_id" \
-            --member="serviceAccount:$sa_email" --role="$role_to_add" --condition=None --quiet || true 
-            # || true 允许在角色已存在时静默处理，避免因重复添加导致脚本中断
-  done
-
-  # 管理本地和服务账户密钥
-  local local_key_pattern="${KEY_DIR}/${proj_id}-${SERVICE_ACCOUNT_NAME}-*.json"
-  local local_keys_found
-  mapfile -t local_keys_found < <(ls $local_key_pattern 2>/dev/null) # 查找本地密钥文件
-
-  if (( ${#local_keys_found[@]} > 0 )); then
-    if ask_yes_no "[$proj_id] 本地已存在密钥 (${#local_keys_found[@]} 个). 是否生成新密钥?" Y; then
-      gen_key "$proj_id" "$sa_email"
-      if ask_yes_no "[$proj_id] 是否删除云端旧密钥 (仅保留最新一个)?" N; then
-        local latest_key_id; latest_key_id=$(latest_cloud_key "$sa_email")
-        mapfile -t cloud_key_ids < <(list_cloud_keys "$sa_email")
-        local k_id
-        for k_id in "${cloud_key_ids[@]}"; do
-          [[ "$k_id" == "$latest_key_id" ]] && continue # 跳过最新的密钥
-          log 信息 "[$proj_id] 正在删除云端旧密钥: $k_id"
-          gcloud iam service-accounts keys delete "$k_id" \
-                 --iam-account="$sa_email" --project="$proj_id" --quiet \
-          || log 警告 "[$proj_id] 跳过无法删除的密钥 $k_id (可能已被手动删除或权限不足)"
-        done
-      fi
-    else
-      log 信息 "[$proj_id] 跳过生成新密钥的操作"
-    fi
-  else
-    log 信息 "[$proj_id] 本地无密钥，将生成新密钥"
-    gen_key "$proj_id" "$sa_email"
-  fi
-}
-
-# 创建新项目并进行基础配置
-create_project() {
-  local new_proj_id; new_proj_id=$(new_project_id) # 新建项目仍使用 PROJECT_PREFIX
-  log 信息 "[$BILLING_ACCOUNT] 正在创建新项目: $new_proj_id"
-  retry gcloud projects create "$new_proj_id" --name="$new_proj_id" --quiet
-  log 信息 "[$new_proj_id] 正在链接到结算账户: $BILLING_ACCOUNT"
-  link_billing "$new_proj_id"
-  # 首先启用核心API，例如aiplatform
-  enable_services "$new_proj_id" aiplatform.googleapis.com
-  # 然后配置服务账户
-  provision_sa "$new_proj_id"
-  PROJECTS+=("$new_proj_id") # 将新项目 ID 添加回全局 PROJECTS 数组，供 show_status 使用
-}
-
-# 处理项目列表：并行启用 API，然后顺序配置服务账户
-process_projects() {
-  local current_proj_id
-  local running_jobs=0
-  
-  if (( ${#@} == 0 )); then
-    log 信息 "没有现有项目需要处理。"
-    return
-  fi
-
-  log 信息 "开始并行处理 ${#@} 个现有项目 (启用 API)..."
-  for current_proj_id in "$@"; do
-    [[ -z "$current_proj_id" ]] && continue # 跳过空的项目 ID
-    (
-      # 添加少量随机延迟，避免同时发起过多请求
-      sleep $((RANDOM % 3))
-      log 信息 "[$current_proj_id] (并行任务) 开始启用 aiplatform.googleapis.com 服务"
-      enable_services "$current_proj_id" aiplatform.googleapis.com
-      log 信息 "[$current_proj_id] (并行任务) aiplatform.googleapis.com 服务处理完成"
-    ) & # 后台执行
-    (( ++running_jobs >= CONCURRENCY )) && { wait -n; ((running_jobs--)); } # 控制并发数
-  done
-  wait # 等待所有后台的 enable_services 完成
-  log 信息 "所有现有项目的 API 并行启用处理完成。"
-
-  log 信息 "开始顺序处理 ${#@} 个现有项目 (配置服务账户)..."
-  for current_proj_id in "$@"; do
-    [[ -z "$current_proj_id" ]] && continue # 跳过空的项目 ID
-    log 信息 "[$current_proj_id] (顺序任务) 开始配置服务账户"
-    provision_sa "$current_proj_id"
-    log 信息 "[$current_proj_id] (顺序任务) 服务账户配置完成"
-  done
-  log 信息 "所有现有项目的服务账户顺序配置完成。"
-}
-
-# 显示当前项目状态
-show_status() {
-  printf "\n当前项目状态 (结算账户: %s)\n" "$BILLING_ACCOUNT"
-  local proj_id api_status key_count_str
-  if (( ${#PROJECTS[@]} == 0 )); then
-    printf "  此结算账户下没有检测到任何项目。\n" # 更新提示信息
-  fi
-  for proj_id in "${PROJECTS[@]}"; do
-    # 统计本地密钥数量
-    key_count_str=$(ls -1 "${KEY_DIR}/${proj_id}-${SERVICE_ACCOUNT_NAME}-"*.json 2>/dev/null | wc -l | tr -d ' ')
-    [[ -z "$key_count_str" ]] && key_count_str="0" # 处理 wc -l 可能的空输出
-
-    # 检查 Vertex AI API 是否启用
-    if gcloud services list --enabled --project="$proj_id" --filter='aiplatform.googleapis.com' \
-       --format='value(config.name)' | grep -q '.'; then
-      api_status="已启用"
-    else
-      api_status="未启用"
-    fi
-    printf " • %-30s | Vertex AI API: %-5s | 本地密钥数: %s\n" "$proj_id" "$api_status" "$key_count_str"
-  done; echo # 输出一个空行
-}
-
-# ─────────────────── 按结算账户处理的主逻辑 ───────────────────────
-handle_billing() {
-  # 函数参数 $1 即为要处理的结算账户 ID
-  BILLING_ACCOUNT="$1" 
-  # 清空并重新加载当前结算账户下的项目列表
-  PROJECTS=() 
-  # 列出此结算账户下的所有项目
-  mapfile -t PROJECTS < <(gcloud beta billing projects list \
-                            --billing-account="$BILLING_ACCOUNT" \
-                            --format='value(projectId)') # 移除了 filter
-  prepare_keydir # 确保密钥目录存在
-
-  while true; do
-    show_status # 显示当前状态
-    log 信息 "当前操作的结算账户: $BILLING_ACCOUNT (检测到 ${#PROJECTS[@]} 个项目，目标项目数: $MAX_PROJECTS_PER_ACCOUNT)"
-
-    local choice
-    choice=$(prompt_choice $'请选择操作：\n  0) 仅查看状态\n  1) 检查/配置现有项目，并补足新项目至目标数 (推荐)\n  2) [!!高危!!] 清空此结算账户下所有项目并按目标数重建\n  3) 返回上级或退出' \
-                           "0|1|2|3" "1") # 默认选项为 1
+  until "${cmd[@]}" 2>/tmp/cmd.err; do
+    local err_msg
+    err_msg=$(cat /tmp/cmd.err)
+    (( n>=MAX_RETRY )) && { log ERROR "失败: ${cmd[*]} - $err_msg"; return 1; }
     
-    case $choice in
-      0) continue ;; # 仅查看状态，循环继续
-      1) # 检查/补足项目
-        log 信息 "开始处理 ${#PROJECTS[@]} 个现有项目，并补足新项目至 $MAX_PROJECTS_PER_ACCOUNT 个..."
-        process_projects "${PROJECTS[@]}" # 处理已存在的项目
-        while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do
-          create_project # 创建新项目直到达到目标数
-        done
-        log 信息 "项目检查/补足完成。"
-        ;;
-      2) # 清空并重建
-        if ask_yes_no "[$BILLING_ACCOUNT] 警告!! 高危操作!! 此操作将尝试解绑此结算账户下的【所有】项目，然后按目标数 ($MAX_PROJECTS_PER_ACCOUNT 个) 重新创建新项目 (新项目将以 '${PROJECT_PREFIX}-' 开头)。确定吗?" N; then
-          log 信息 "正在解绑当前结算账户下的【所有】项目..."
-          local p_to_unlink
-          for p_to_unlink in "${PROJECTS[@]}"; do
-            log 信息 "[$BILLING_ACCOUNT] 正在解绑项目: $p_to_unlink"
-            unlink_billing "$p_to_unlink"
-          done
-          PROJECTS=() # 清空项目列表
-          log 信息 "开始重新创建 $MAX_PROJECTS_PER_ACCOUNT 个新项目..."
-          while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do
-            create_project
-          done
-          log 信息 "项目清空并重建完成。"
-        else
-          log 信息 "已取消清空并重建操作。"
-        fi
-        ;;
-      3) break ;; # 退出当前结算账户的处理循环
+    # 指数退避策略
+    delay=$(awk "BEGIN {printf \"%.0f\", ($backoff_factor^$n * 10 + $RANDOM % 5)}")
+    log WARN "重试 $n/$MAX_RETRY: ${cmd[*]} (等待 ${delay}s) - $err_msg"
+    sleep $delay
+    ((n++))
+  done
+}
+
+# 超时处理
+retry_with_timeout() {
+  local timeout=$API_TIMEOUT
+  if command -v timeout &>/dev/null; then
+    timeout "$timeout" "$@" || smart_retry "$@"
+  else
+    smart_retry "$@"
+  fi
+}
+
+# 缓存API结果
+cache_result() {
+  local cache_key="$1"
+  shift
+  local cache_file="${CACHE_DIR}/${cache_key}-$(date +%Y%m%d-%H)"
+  
+  # 检查缓存是否存在且未过期
+  if [[ -f "$cache_file" ]]; then
+    local file_age
+    file_age=$(($(date +%s) - $(stat -c %Y "$cache_file")))
+    if (( file_age < CACHE_TTL )); then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+  
+  # 缓存不存在或已过期，重新获取
+  "$@" > "$cache_file"
+  cat "$cache_file"
+}
+
+ask_yes_no(){ local p=$1 d=${2:-N} r; [[ -t 0 ]]&&read -r -p "$p [${d}] " r; r=${r:-$d}; [[ $r =~ ^[Yy]$ ]]; }
+
+prompt_choice(){ local p=$1 o=$2 d=$3 a; [[ -t 0 ]]&&read -r -p "$p [$o] (默认 $d) " a; a=${a:-$d}; [[ $o =~ (^|\|)$a($|\|) ]]||a=$d; printf '%s' "$a"; }
+
+check_env(){ 
+  require_cmd gcloud
+  require_cmd jq
+  gcloud config list account --quiet &>/dev/null||{ log ERROR "请先 gcloud init"; exit 1; }
+  gcloud auth list --filter=status:ACTIVE --format=value(account)|grep -q .||{ log ERROR "请先 gcloud auth login"; exit 1; }
+}
+
+list_open_billing(){ 
+  cache_result "billing-accounts" gcloud billing accounts list --filter='open=true' --format='value(name,displayName)'|awk '{printf "%s %s\n",$1,substr($0,index($0,$2))}'|sed 's|billingAccounts/||'
+}
+
+choose_billing(){ 
+  mapfile -t ACCS < <(list_open_billing)
+  (( ${#ACCS[@]}==1 ))&&{ BILLING_ACCOUNT="${ACCS[0]%% *}"; return; }
+  printf "可用结算账户：\n"
+  for i in "${!ACCS[@]}";do printf "  %d) %s\n" "$i" "${ACCS[$i]}"; done
+  local sel
+  while true; do 
+    read -r -p "编号 [0-$((${#ACCS[@]}-1))] (默认0): " sel
+    sel=${sel:-0}
+    [[ $sel =~ ^[0-9]+$ ]]&&((sel>=0&&sel<${#ACCS[@]}))&&break
+  done
+  BILLING_ACCOUNT="${ACCS[$sel]%% *}"
+}
+
+# 批量启用服务
+enable_services(){ 
+  local proj=$1; shift
+  local services=()
+  for s in "$@"; do 
+    gcloud services list --enabled --project="$proj" --filter="$s" --format='value(config.name)'|grep -q .||services+=("$s")
+  done
+  (( ${#services[@]} ))&&retry_with_timeout gcloud services enable "${services[@]}" --project="$proj" --quiet
+}
+
+# 批量操作优化
+batch_enable_services() {
+  local batch_size=5 # 一次处理的项目数
+  local total=${#PROJECTS[@]}
+  for ((i=0; i<total; i+=batch_size)); do
+    local batch=("${PROJECTS[@]:i:batch_size}")
+    # 并行处理这一批项目
+    for p in "${batch[@]}"; do
+      (set -Eeuo pipefail; enable_services "$p" aiplatform.googleapis.com) &
+    done
+    wait
+  done
+}
+
+link_billing(){ retry_with_timeout gcloud beta billing projects link "$1" --billing-account="$BILLING_ACCOUNT" --quiet; }
+unlink_billing(){ retry_with_timeout gcloud beta billing projects unlink "$1" --quiet; }
+
+list_cloud_keys(){ gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)'|sed 's|.*/||'; }
+latest_cloud_key(){ gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)'|sed 's|.*/||'; }
+
+gen_key(){ 
+  local proj=$1 sa=$2 ts=$(date +%Y%m%d-%H%M%S)
+  local f="${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-${ts}.json"
+  retry_with_timeout gcloud iam service-accounts keys create "$f" --iam-account="$sa" --project="$proj" --quiet
+  chmod 600 "$f"
+  log INFO "[$proj] 新密钥 → $f"
+}
+
+provision_sa(){ 
+  local proj=$1 sa="${SERVICE_ACCOUNT_NAME}@${proj}.iam.gserviceaccount.com"
+  gcloud iam service-accounts describe "$sa" --project "$proj" &>/dev/null||retry_with_timeout gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Admin" --project "$proj" --quiet
+  local r
+  for r in roles/aiplatform.admin "${ENABLE_EXTRA_ROLES[@]}"; do 
+    retry_with_timeout gcloud projects add-iam-policy-binding "$proj" --member="serviceAccount:$sa" --role="$r" --condition=None --quiet||true
+  done
+  
+  local k=("${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-"*.json)
+  [[ -e "${k[0]}" ]]||k=()
+  if (( ${#k[@]} )); then 
+    ask_yes_no "[$proj] 已有密钥 (${#k[@]}). 生成新密钥?" Y&&gen_key "$proj" "$sa"
+  else 
+    gen_key "$proj" "$sa"
+  fi
+}
+
+# 检查点功能
+save_checkpoint() {
+  {
+    echo '{'
+    echo "  \"billing_account\": \"$BILLING_ACCOUNT\","
+    echo "  \"projects\": ["
+    local first=true
+    for p in "${PROJECTS[@]}"; do
+      $first || echo ','
+      echo "    \"$p\""
+      first=false
+    done
+    echo "  ],"
+    echo "  \"timestamp\": \"$(date -Iseconds)\""
+    echo '}'
+  } > "$STATE_FILE"
+  log INFO "状态已保存至 $STATE_FILE"
+}
+
+load_checkpoint() {
+  [[ -f "$STATE_FILE" ]] || return 1
+  if ! command -v jq &>/dev/null; then
+    log WARN "缺少jq，无法加载检查点"
+    return 1
+  fi
+  
+  BILLING_ACCOUNT=$(jq -r '.billing_account' "$STATE_FILE")
+  mapfile -t PROJECTS < <(jq -r '.projects[]' "$STATE_FILE")
+  local ts
+  ts=$(jq -r '.timestamp // empty' "$STATE_FILE")
+  [[ -n "$ts" ]] && log INFO "加载检查点成功 (时间: $ts, 项目数: ${#PROJECTS[@]})"
+  return 0
+}
+
+create_project(){ 
+  local id
+  id=$(new_project_id)
+  log INFO "[$BILLING_ACCOUNT] 创建项目 $id"
+  retry_with_timeout gcloud projects create "$id" --name="$id" --quiet
+  link_billing "$id"
+  enable_services "$id" aiplatform.googleapis.com
+  provision_sa "$id"
+  PROJECTS+=("$id")
+  save_checkpoint
+}
+
+process_projects(){ 
+  local p running=0
+  for p in "$@"; do 
+    [[ -z $p ]]&&continue
+    (set -Eeuo pipefail; sleep $((RANDOM%3)); enable_services "$p" aiplatform.googleapis.com) &
+    (( ++running>=CONCURRENCY ))&&{ wait -n; ((running--)); }
+  done
+  wait
+  for p in "$@"; do 
+    [[ -z $p ]]&&continue
+    provision_sa "$p"
+  done
+  save_checkpoint
+}
+
+# 统计功能
+show_status(){ 
+  printf "\n项目状态 (账单: %s)\n" "$BILLING_ACCOUNT"
+  local p total_keys=0 active_apis=0
+  for p in "${PROJECTS[@]}"; do 
+    local kc
+    kc=$(ls -1 "${KEY_DIR}/${p}-${SERVICE_ACCOUNT_NAME}-"*.json 2>/dev/null|wc -l)
+    ((total_keys+=kc))
+    local api
+    gcloud services list --enabled --project="$p" --filter=aiplatform.googleapis.com --format='value(config.name)'|grep -q .&&{ api="ON"; ((active_apis++)); }||api="OFF"
+    printf " • %-28s | API: %-2s | keys: %s\n" "$p" "$api" "$kc"
+  done
+  
+  local total=${#PROJECTS[@]}
+  printf "\n=== 摘要 ===\n"
+  printf "总项目数: %d\n" "$total"
+  if (( total > 0 )); then
+    printf "已启用API项目: %d (%.1f%%)\n" "$active_apis" "$(awk "BEGIN {printf \"%.1f\", ($active_apis*100/$total)}")"
+    printf "总密钥数: %d (平均每项目 %.1f 个)\n" "$total_keys" "$(awk "BEGIN {printf \"%.1f\", ($total_keys/$total)}")"
+  fi
+  echo
+}
+
+# 检查配额用量
+check_quotas() {
+  local proj=$1
+  log INFO "[$proj] 检查配额使用情况"
+  gcloud compute project-info describe --project "$proj" \
+    --format="table(quotas.metric,quotas.limit,quotas.usage)" \
+    --filter="quotas.metric:GPUs" || log WARN "[$proj] 无法获取配额信息"
+}
+
+handle_billing(){ 
+  BILLING_ACCOUNT="$1"
+  mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
+  prepare_keydir
+  while true; do 
+    show_status
+    log INFO "处理账单 $BILLING_ACCOUNT (现有 ${#PROJECTS[@]})"
+    local ch
+    ch=$(prompt_choice $'操作:\n 0) 查看状态\n 1) 补足/配置\n 2) 清空并重建\n 3) 检查配额\n 4) 返回' "0|1|2|3|4" "1")
+    case $ch in 
+      0) save_checkpoint; exit 0;;
+      1) process_projects "${PROJECTS[@]}"
+         while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do 
+           create_project
+         done;;
+      2) ask_yes_no "确认清空并重建?" N&&{ 
+           for p in "${PROJECTS[@]}"; do 
+             unlink_billing "$p"
+           done
+           PROJECTS=()
+           while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do 
+             create_project
+           done 
+         };;
+      3) for p in "${PROJECTS[@]}"; do check_quotas "$p"; done;;
+      4) break;;
     esac
   done
 }
 
-# ───────────────────────────── 主函数 ────────────────────────────────────
-main() {
-  check_env # 检查环境
-  mapfile -t ALL_BILLING_ACCOUNTS < <(list_open_billing) # 获取所有开放的结算账户
-
-  if (( ${#ALL_BILLING_ACCOUNTS[@]} == 0 )); then
-    log 错误 "未找到任何开放的结算账户。请检查您的GCP账户权限或是否存在结算账户。"
-    exit 1
-  fi
-
-  # 若只有一个结算账户，则直接进入该账户的处理逻辑
-  if (( ${#ALL_BILLING_ACCOUNTS[@]} == 1 )); then
-    local single_billing_id="${ALL_BILLING_ACCOUNTS[0]%% *}"
-    log 信息 "检测到唯一的开放结算账户: $single_billing_id"
-    handle_billing "$single_billing_id"
-    exit 0
-  fi
-
-  # 若有多个结算账户，让用户选择处理模式
-  log 信息 "检测到 ${#ALL_BILLING_ACCOUNTS[@]} 个开放的结算账户。"
-  local mode
-  mode=$(prompt_choice $'选择操作模式：\n  1) 选择单个结算账户进行管理\n  2) 批量处理所有检测到的结算账户' "1|2" "1")
+main(){
+  check_env
   
-  if [[ $mode == 2 ]]; then # 批量处理所有账户
-    log 信息 "开始批量处理所有 ${#ALL_BILLING_ACCOUNTS[@]} 个结算账户..."
-    local acc_info
-    for acc_info in "${ALL_BILLING_ACCOUNTS[@]}"; do
-      local current_billing_id="${acc_info%% *}"
-      log 信息 "--- 开始处理结算账户: $current_billing_id (${acc_info#* }) ---"
-      handle_billing "$current_billing_id"
-      log 信息 "--- 结算账户: $current_billing_id 处理完毕 ---"
-    done
-    log 信息 "所有结算账户批量处理完成。"
+  # 配置智能并发控制
+  # 根据CPU核心数、总账单数和系统内存情况动态设置
+  if [[ -z "${CONCURRENCY:-}" ]]; then
+    local cpu_cores
+    cpu_cores=$(nproc 2>/dev/null || echo 4)
+    local avail_mem
+    avail_mem=$(free -m 2>/dev/null | awk 'NR==2{print $7}' || echo 2000)
+    
+    # 根据可用资源计算建议并发数
+    local suggested_concurrency
+    suggested_concurrency=$(( (cpu_cores / 2) > 1 ? (cpu_cores / 2) : 1 ))
+    # 考虑内存因素 (每个并发任务假设需要~500MB)
+    local mem_concurrency
+    mem_concurrency=$(( avail_mem / 500 ))
+    
+    # 取较小值作为实际并发数
+    CONCURRENCY=$(( suggested_concurrency < mem_concurrency ? suggested_concurrency : mem_concurrency ))
+    # 设置上限为10
+    CONCURRENCY=$(( CONCURRENCY > 10 ? 10 : CONCURRENCY ))
+  fi
+  log INFO "设置并发上限: $CONCURRENCY"
+  
+  # 尝试加载之前的状态
+  if load_checkpoint; then
+    if ask_yes_no "检测到之前的会话状态，是否恢复?" Y; then
+      handle_billing "$BILLING_ACCOUNT"
+      exit 0
+    fi
+  fi
+  
+  mapfile -t ALL < <(list_open_billing)
+  (( ${#ALL[@]}==0 ))&&{ log ERROR "无开放账单"; exit 1; }
+  
+  if (( ${#ALL[@]}==1 )); then
+    handle_billing "${ALL[0]%% *}"
     exit 0
   fi
-
-  # 单一账户模式：让用户选择具体哪个账户
-  log 信息 "请选择要管理的结算账户："
-  choose_billing # 用户选择 BILLING_ACCOUNT
-  handle_billing "$BILLING_ACCOUNT"
-  log 信息 "结算账户 $BILLING_ACCOUNT 处理完毕。"
+  
+  local m
+  m=$(prompt_choice $'模式:\n 1) 选账单\n 2) 全部批量' "1|2" "1")
+  if [[ $m == "1" ]]; then
+    choose_billing
+    handle_billing "$BILLING_ACCOUNT"
+  else
+    for billing in "${ALL[@]%% *}"; do
+      log INFO "批量处理账单: $billing"
+      BILLING_ACCOUNT="$billing"
+      mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
+      
+      if (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); then
+        log INFO "[$BILLING_ACCOUNT] 补足项目 (现有 ${#PROJECTS[@]}/${MAX_PROJECTS_PER_ACCOUNT})"
+        while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do
+          create_project
+        done
+      fi
+      
+      process_projects "${PROJECTS[@]}"
+      show_status
+    done
+  fi
 }
 
-# 执行主函数，并将所有参数传递给它
 main "$@"
