@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "$LINENO" "$?" >&2' ERR
 
-# ────────────────────────────────────────────
-# Config (env‑overridable)
-# ────────────────────────────────────────────
+# ───────────────────────────────── Config (env-overridable)
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 KEY_DIR="${KEY_DIR:-./keys}"
 MAX_RETRY=${MAX_RETRY:-3}
+CONCURRENCY=${CONCURRENCY:-5}                                 # 并行启用 API 上限
 ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
+# ───────────────────────────────────────────────────────────
 
 log() { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
 
@@ -57,10 +56,7 @@ list_open_billing() {
 choose_billing() {
   mapfile -t ACCS < <(list_open_billing)
   (( ${#ACCS[@]} == 0 )) && { log ERROR "未找到 OPEN 结算账户"; exit 1; }
-  if (( ${#ACCS[@]} == 1 )); then
-    BILLING_ACCOUNT="${ACCS[0]%% *}"
-    return
-  fi
+  if (( ${#ACCS[@]} == 1 )); then BILLING_ACCOUNT="${ACCS[0]%% *}"; return; fi
   printf "可用结算账户：\n"
   local i; for i in "${!ACCS[@]}"; do printf "  %d) %s\n" "$i" "${ACCS[$i]}"; done
   local sel
@@ -91,19 +87,29 @@ unlink_billing(){ retry gcloud beta billing projects unlink "$1" --quiet; }
 
 create_project() {
   local pid=$(new_project_id)
-  log INFO "创建项目 $pid"
+  log INFO "[$BILLING_ACCOUNT] 创建项目 $pid"
   retry gcloud projects create "$pid" --name="$pid" --quiet
   link_billing "$pid"
   enable_services "$pid" aiplatform.googleapis.com
   provision_sa "$pid"
-  NEW_PROJECTS+=("$pid")
 }
 
+# ───────── 并行启用 API（限速）+ 顺序置备 SA/Key ─────────
 process_projects() {
-  local p pid_arr=()
-  for p in "$@"; do ( enable_services "$p" aiplatform.googleapis.com ) & pid_arr+=("$!"); done
-  for pid in "${pid_arr[@]}"; do wait "$pid"; done
-  for p in "$@"; do provision_sa "$p"; done
+  local proj pids=() running=0
+  for proj in "$@"; do
+    (
+      sleep $((RANDOM%3))
+      enable_services "$proj" aiplatform.googleapis.com
+    ) & pids+=("$!")
+    (( running++ ))
+    if (( running >= CONCURRENCY )); then
+      wait -n  # Bash ≥5
+      (( running-- ))
+    fi
+  done
+  wait  # 等所有启用任务完成
+  for proj in "$@"; do provision_sa "$proj"; done
 }
 
 list_cloud_keys()   { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
@@ -130,7 +136,11 @@ provision_sa() {
       if ask_yes_no "[$proj] 删除云端旧密钥(保留最新)?" N; then
         local latest=$(latest_cloud_key "$sa")
         mapfile -t key_ids < <(list_cloud_keys "$sa")
-        for k in "${key_ids[@]}"; do [[ $k == "$latest" ]] && continue; retry gcloud iam service-accounts keys delete "$k" --iam-account="$sa" --quiet; log INFO "[$proj] 删除云端旧密钥 $k"; done
+        for k in "${key_ids[@]}"; do
+          [[ $k == "$latest" ]] && continue
+          retry gcloud iam service-accounts keys delete "$k" --iam-account="$sa" --quiet
+          log INFO "[$proj] 删除云端旧密钥 $k"
+        done
       fi
     else
       log INFO "[$proj] 跳过新密钥生成"
@@ -152,32 +162,26 @@ show_status() {
   printf "\n"
 }
 
-main() {
-  check_env
-  choose_billing
-  prepare_key_dir
+handle_billing() {
+  BILLING_ACCOUNT="$1"
   mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
   local count=${#PROJECTS[@]}
   log INFO "使用结算账户: $BILLING_ACCOUNT (已绑定 $count / $MAX_PROJECTS_PER_ACCOUNT 项目)"
-  declare -a NEW_PROJECTS
+  process_projects "${PROJECTS[@]}"
+  while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
+}
 
-  while true; do
-    show_status
-    case $(prompt_choice $'请选择操作：\n 0) 仅查看状态\n 1) 新建/补足项目\n 2) 清空并重建\n 3) 退出' "0|1|2|3" "1") in
-      0) continue ;;
-      1)
-        process_projects "${PROJECTS[@]}"
-        while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
-        break ;;
-      2)
-        for p in "${PROJECTS[@]}"; do unlink_billing "$p"; done
-        PROJECTS=(); count=0
-        while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
-        break ;;
-      3) exit 0 ;;
-    esac
-  done
-  show_status
+main() {
+  check_env
+  mapfile -t ALL_BILLING < <(list_open_billing)
+  printf "请选择模式：\n 1) 单一结算账户  2) 批量处理全部结算账户\n"
+  local mode; mode=$(prompt_choice "输入 1 或 2" "1|2" "1")
+  if [[ $mode == 2 ]]; then
+    for acc in "${ALL_BILLING[@]}"; do handle_billing "${acc%% *}"; done
+    exit 0
+  fi
+  choose_billing
+  handle_billing "$BILLING_ACCOUNT"
 }
 
 main "$@"
