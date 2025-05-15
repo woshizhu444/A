@@ -77,8 +77,9 @@ choose_billing() {
   BILLING_ACCOUNT="${ACCS[$sel]%% *}"
 }  # choose_billing
 
-prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
+prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
 unique_suffix() { date +%s%N | sha256sum | head -c6; }
+new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }() { date +%s%N | sha256sum | head -c6; }
 new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 
 enable_services() {
