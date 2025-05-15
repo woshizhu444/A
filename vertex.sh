@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "$LINENO" "$?" >&2' ERR
 
-BILLING_ACCOUNT="000000-AAAAAA-BBBBBB"   # 默认自动检测首个 OPEN 结算账户
+BILLING_ACCOUNT="000000-AAAAAA-BBBBBB"
 PROJECT_PREFIX="vertex"
 MAX_PROJECTS_PER_ACCOUNT=3
 SERVICE_ACCOUNT_NAME="vertex-admin"
@@ -57,8 +57,7 @@ new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 enable_services() {
   local p=$1 svc; shift
   for svc in "$@"; do
-    gcloud services list --enabled --project="$p" --filter="$svc" \
-          --format='value(config.name)' | grep -q . && continue
+    gcloud services list --enabled --project="$p" --filter="$svc" --format='value(config.name)' | grep -q . && continue
     retry gcloud services enable "$svc" --project="$p" --quiet
   done
 }
@@ -76,12 +75,9 @@ create_project() {
   NEW_PROJECTS+=("$pid")
 }
 
-# 并行启用 API，随后串行置备密钥
 process_projects() {
   local p pids=()
-  for p in "$@"; do
-    ( enable_services "$p" aiplatform.googleapis.com ) & pids+=("$!")
-  done
+  for p in "$@"; do ( enable_services "$p" aiplatform.googleapis.com ) & pids+=("$!"); done
   for pid in "${pids[@]}"; do wait "$pid"; done
   for p in "$@"; do provision_sa "$p"; done
 }
@@ -92,8 +88,7 @@ latest_cloud_key()  { gcloud iam service-accounts keys list --iam-account="$1" -
 gen_key() {
   local proj=$1 sa=$2 ts=$(date +%Y%m%d-%H%M%S)
   local key_file="${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-${ts}.json"
-  retry gcloud iam service-accounts keys create "$key_file" \
-        --iam-account="$sa" --project="$proj" --quiet
+  retry gcloud iam service-accounts keys create "$key_file" --iam-account="$sa" --project="$proj" --quiet
   chmod 600 "$key_file"
   log INFO "[$proj] 新密钥已创建 → $key_file"
 }
@@ -103,13 +98,11 @@ provision_sa() {
   local sa="${SERVICE_ACCOUNT_NAME}@${proj}.iam.gserviceaccount.com"
 
   gcloud iam service-accounts describe "$sa" --project "$proj" &>/dev/null || \
-    retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
-          --display-name="Vertex Admin" --project "$proj" --quiet
+    retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Admin" --project "$proj" --quiet
 
   local roles=(roles/aiplatform.admin "${ENABLE_EXTRA_ROLES[@]}")
   for r in "${roles[@]}"; do
-    retry gcloud projects add-iam-policy-binding "$proj" \
-          --member="serviceAccount:$sa" --role="$r" --quiet || true
+    retry gcloud projects add-iam-policy-binding "$proj" --member="serviceAccount:$sa" --role="$r" --quiet || true
   done
 
   local local_keys=("${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-"*.json)
@@ -123,8 +116,7 @@ provision_sa() {
         mapfile -t key_ids < <(list_cloud_keys "$sa")
         for k in "${key_ids[@]}"; do
           [[ $k == "$latest" ]] && continue
-          retry gcloud iam service-accounts keys delete "$k" \
-                --iam-account="$sa" --quiet
+          retry gcloud iam service-accounts keys delete "$k" --iam-account="$sa" --quiet
           log INFO "[$proj] 删除云端旧密钥 $k"
         done
       fi
@@ -142,8 +134,7 @@ show_status() {
   for proj in "${PROJECTS[@]}"; do
     sa="${SERVICE_ACCOUNT_NAME}@${proj}.iam.gserviceaccount.com"
     keycount=$(ls -1 ${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-*.json 2>/dev/null | wc -l || true)
-    gcloud services list --enabled --project="$proj" --filter='aiplatform.googleapis.com' \
-          --format='value(config.name)' | grep -q . && api="ON" || api="OFF"
+    gcloud services list --enabled --project="$proj" --filter='aiplatform.googleapis.com' --format='value(config.name)' | grep -q . && api="ON" || api="OFF"
     printf " • %-28s | Vertex API: %-3s | 本地密钥: %s\n" "$proj" "$api" "$keycount"
   done
   printf "\n"
@@ -155,35 +146,28 @@ main() {
   [[ -z $BILLING_ACCOUNT ]] && { log ERROR "未找到 OPEN 结算账户"; exit 1; }
 
   prepare_key_dir
-  mapfile -t PROJECTS < <(gcloud beta billing projects list \
-                          --billing-account="$BILLING_ACCOUNT" \
-                          --format='value(projectId)')
+  mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
   local count=${#PROJECTS[@]}
   log INFO "使用结算账户: $BILLING_ACCOUNT (已绑定 $count / $MAX_PROJECTS_PER_ACCOUNT 项目)"
 
   declare -a NEW_PROJECTS
-  show_status
 
-  case $(prompt_choice \
-           "请选择操作: 0) 仅查看状态  1) 新建/补足项目  2) 清空并重建  3) 退出" \
-           "0|1|2|3" "1") in
-    0) exit 0 ;;
-    1)
-      process_projects "${PROJECTS[@]}"
-      while (( count < MAX_PROJECTS_PER_ACCOUNT )); do
-        create_project; ((count++))
-      done
-      ;;
-    2)
-      for p in "${PROJECTS[@]}"; do unlink_billing "$p"; done
-      PROJECTS=()
-      count=0
-      while (( count < MAX_PROJECTS_PER_ACCOUNT )); do
-        create_project; ((count++))
-      done
-      ;;
-    3) exit 0 ;;
-  esac
+  while true; do
+    show_status
+    case $(prompt_choice $'请选择操作：\n 0) 仅查看状态\n 1) 新建/补足项目\n 2) 清空并重建\n 3) 退出' "0|1|2|3" "1") in
+      0) continue ;;
+      1)
+        process_projects "${PROJECTS[@]}"
+        while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
+        break ;;
+      2)
+        for p in "${PROJECTS[@]}"; do unlink_billing "$p"; done
+        PROJECTS=(); count=0
+        while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
+        break ;;
+      3) exit 0 ;;
+    esac
+  done
 
   show_status
 }
