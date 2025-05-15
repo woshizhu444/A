@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # r21 – 恢复 0/1/2/3 菜单，支持多结算账户，修复 proj 变量及密钥删除问题
 # v2 - 修复 gcloud 命令中注释导致参数错误的问题
+# v3 - 修改为管理结算账户下的所有项目，不仅仅是带前缀的项目
 
 set -Eeuo pipefail
 trap 'printf "[错误] 在行 %d 中止 (退出码 %d)\n" "$LINENO" "$?" >&2' ERR
 
 # ────────────────────── 配置 (可通过环境变量覆盖) ──────────────────────
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}" # 默认结算账户 ID
-PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"                 # 项目 ID 前缀
-MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}    # 每个结算账户的最大项目数
+PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"                 # 新建项目时使用的 ID 前缀
+MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}    # 每个结算账户的目标项目数 (用于补足或重建)
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}" # 服务账户名称
 KEY_DIR="${KEY_DIR:-./keys}"                               # 服务账户密钥存储目录
 MAX_RETRY=${MAX_RETRY:-3}                                  # 命令失败最大重试次数
@@ -24,7 +25,7 @@ require_cmd() { command -v "$1" &>/dev/null || { log 错误 "缺少依赖: $1"; 
 prepare_keydir(){ mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
 # 生成唯一后缀 (6位字符)
 unique_suffix() { date +%s%N | sha256sum | head -c6; }
-# 生成新的项目 ID
+# 生成新的项目 ID (仍然使用 PROJECT_PREFIX)
 new_project_id(){ echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 
 # 重试命令直到成功，或达到最大重试次数
@@ -206,7 +207,7 @@ provision_sa() {
 
 # 创建新项目并进行基础配置
 create_project() {
-  local new_proj_id; new_proj_id=$(new_project_id)
+  local new_proj_id; new_proj_id=$(new_project_id) # 新建项目仍使用 PROJECT_PREFIX
   log 信息 "[$BILLING_ACCOUNT] 正在创建新项目: $new_proj_id"
   retry gcloud projects create "$new_proj_id" --name="$new_proj_id" --quiet
   log 信息 "[$new_proj_id] 正在链接到结算账户: $BILLING_ACCOUNT"
@@ -223,7 +224,12 @@ process_projects() {
   local current_proj_id
   local running_jobs=0
   
-  log 信息 "开始并行处理项目 (启用 API)..."
+  if (( ${#@} == 0 )); then
+    log 信息 "没有现有项目需要处理。"
+    return
+  fi
+
+  log 信息 "开始并行处理 ${#@} 个现有项目 (启用 API)..."
   for current_proj_id in "$@"; do
     [[ -z "$current_proj_id" ]] && continue # 跳过空的项目 ID
     (
@@ -236,16 +242,16 @@ process_projects() {
     (( ++running_jobs >= CONCURRENCY )) && { wait -n; ((running_jobs--)); } # 控制并发数
   done
   wait # 等待所有后台的 enable_services 完成
-  log 信息 "所有项目的 API 并行启用处理完成。"
+  log 信息 "所有现有项目的 API 并行启用处理完成。"
 
-  log 信息 "开始顺序处理项目 (配置服务账户)..."
+  log 信息 "开始顺序处理 ${#@} 个现有项目 (配置服务账户)..."
   for current_proj_id in "$@"; do
     [[ -z "$current_proj_id" ]] && continue # 跳过空的项目 ID
     log 信息 "[$current_proj_id] (顺序任务) 开始配置服务账户"
     provision_sa "$current_proj_id"
     log 信息 "[$current_proj_id] (顺序任务) 服务账户配置完成"
   done
-  log 信息 "所有项目的服务账户顺序配置完成。"
+  log 信息 "所有现有项目的服务账户顺序配置完成。"
 }
 
 # 显示当前项目状态
@@ -253,7 +259,7 @@ show_status() {
   printf "\n当前项目状态 (结算账户: %s)\n" "$BILLING_ACCOUNT"
   local proj_id api_status key_count_str
   if (( ${#PROJECTS[@]} == 0 )); then
-    printf "  此结算账户下没有通过本脚本管理的项目 (基于项目前缀 '%s-' 过滤)。\n" "$PROJECT_PREFIX"
+    printf "  此结算账户下没有检测到任何项目。\n" # 更新提示信息
   fi
   for proj_id in "${PROJECTS[@]}"; do
     # 统计本地密钥数量
@@ -277,34 +283,33 @@ handle_billing() {
   BILLING_ACCOUNT="$1" 
   # 清空并重新加载当前结算账户下的项目列表
   PROJECTS=() 
-  # 仅列出由此脚本创建的项目 (基于 PROJECT_PREFIX 过滤)
+  # 列出此结算账户下的所有项目
   mapfile -t PROJECTS < <(gcloud beta billing projects list \
                             --billing-account="$BILLING_ACCOUNT" \
-                            --filter="projectId:$PROJECT_PREFIX-" \
-                            --format='value(projectId)')
+                            --format='value(projectId)') # 移除了 filter
   prepare_keydir # 确保密钥目录存在
 
   while true; do
     show_status # 显示当前状态
-    log 信息 "当前操作的结算账户: $BILLING_ACCOUNT (已绑定 ${#PROJECTS[@]} / $MAX_PROJECTS_PER_ACCOUNT 个由此脚本管理的项目)"
+    log 信息 "当前操作的结算账户: $BILLING_ACCOUNT (检测到 ${#PROJECTS[@]} 个项目，目标项目数: $MAX_PROJECTS_PER_ACCOUNT)"
 
     local choice
-    choice=$(prompt_choice $'请选择操作：\n  0) 仅查看状态\n  1) 检查/补足项目至上限 (推荐)\n  2) 清空当前结算账户下所有由此脚本创建的项目并重建至上限\n  3) 返回上级或退出' \
+    choice=$(prompt_choice $'请选择操作：\n  0) 仅查看状态\n  1) 检查/配置现有项目，并补足新项目至目标数 (推荐)\n  2) [!!高危!!] 清空此结算账户下所有项目并按目标数重建\n  3) 返回上级或退出' \
                            "0|1|2|3" "1") # 默认选项为 1
     
     case $choice in
       0) continue ;; # 仅查看状态，循环继续
       1) # 检查/补足项目
-        log 信息 "开始处理现有项目并补足至 $MAX_PROJECTS_PER_ACCOUNT 个..."
+        log 信息 "开始处理 ${#PROJECTS[@]} 个现有项目，并补足新项目至 $MAX_PROJECTS_PER_ACCOUNT 个..."
         process_projects "${PROJECTS[@]}" # 处理已存在的项目
         while (( ${#PROJECTS[@]} < MAX_PROJECTS_PER_ACCOUNT )); do
-          create_project # 创建新项目直到达到上限
+          create_project # 创建新项目直到达到目标数
         done
         log 信息 "项目检查/补足完成。"
         ;;
       2) # 清空并重建
-        if ask_yes_no "[$BILLING_ACCOUNT] 警告：此操作将解绑并忽略此结算账户下所有名称以 '${PROJECT_PREFIX}-' 开头的项目，然后重新创建 $MAX_PROJECTS_PER_ACCOUNT 个新项目。确定吗?" N; then
-          log 信息 "正在解绑当前结算账户下的项目 (基于前缀 '${PROJECT_PREFIX}-')..."
+        if ask_yes_no "[$BILLING_ACCOUNT] 警告!! 高危操作!! 此操作将尝试解绑此结算账户下的【所有】项目，然后按目标数 ($MAX_PROJECTS_PER_ACCOUNT 个) 重新创建新项目 (新项目将以 '${PROJECT_PREFIX}-' 开头)。确定吗?" N; then
+          log 信息 "正在解绑当前结算账户下的【所有】项目..."
           local p_to_unlink
           for p_to_unlink in "${PROJECTS[@]}"; do
             log 信息 "[$BILLING_ACCOUNT] 正在解绑项目: $p_to_unlink"
