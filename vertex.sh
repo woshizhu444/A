@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r6)
-# Creates/rotates up to three Vertex‑ready projects under one billing account.
+# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r9)
+# Provisions up to three Vertex‑ready projects under one billing account.
+# r9 adds:  • "状态只读"菜单 0  • 并行启用 Vertex API (per‑project)
 
 set -Eeuo pipefail
 trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "${LINENO}" "$?" >&2'
 
-# Config ---------------------------------------------------------------------
+# ─── Config ──────────────────────────────────────────────────────────────────
 BILLING_ACCOUNT="000000-AAAAAA-BBBBBB"   # auto‑detect if left default
 PROJECT_PREFIX="vertex"                  # project id prefix
-MAX_PROJECTS_PER_ACCOUNT=3
-SERVICE_ACCOUNT_NAME="vertex-admin"
-KEY_DIR="./keys"
-MAX_RETRY=3
-ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
+MAX_PROJECTS_PER_ACCOUNT=3                # one billing account → N projects
+SERVICE_ACCOUNT_NAME="vertex-admin"      # per‑project SA name
+KEY_DIR="./keys"                         # where JSON keys land
+MAX_RETRY=3                               # retry times for gcloud ops
+ENABLE_EXTRA_ROLES=(                      # extra IAM roles for SA
+  roles/iam.serviceAccountUser
+  roles/aiplatform.user
+)
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 log() { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
 
 retry() {
@@ -22,13 +27,25 @@ retry() {
     (( n >= MAX_RETRY )) && { log ERROR "失败: $*"; return 1; }
     delay=$(( n*10 + RANDOM%5 ))
     log WARN "重试 $n/$MAX_RETRY: $* (等待 ${delay}s)"
-    sleep "$delay"
-    (( n++ ))
+    sleep "$delay"; (( n++ ))
   done
 }
 
 require_cmd() { command -v "$1" &>/dev/null || { log ERROR "缺少依赖: $1"; exit 1; }; }
-ask_yes_no() { local p="$1" d=${2:-N} r; [[ -t 0 ]] && read -r -p "$p [${d}] " r; r=${r:-$d}; [[ $r =~ ^[Yy]$ ]]; }
+ask_yes_no() {   # $1 prompt  $2 default (Y/N)
+  local p="$1" d=${2:-N} r
+  [[ -t 0 ]] && read -r -p "$p [${d}] " r
+  r=${r:-$d}
+  [[ $r =~ ^[Yy]$ ]]
+}
+
+prompt_choice() { # $1 prompt  $2 options (e.g. "0|1|2|3")  $3 default
+  local prompt="$1" opts="$2" def="$3" ans
+  [[ -t 0 ]] && read -r -p "$prompt [$opts] (默认 $def) " ans
+  ans=${ans:-$def}
+  [[ $opts =~ (^|\|)$ans($|\|) ]] || ans=$def
+  printf '%s' "$ans"
+}
 
 check_env() {
   require_cmd gcloud
@@ -66,7 +83,18 @@ create_project() {
   NEW_PROJECTS+=("$pid")
 }
 
-process_existing_projects() { for p in "$@"; do enable_services "$p" aiplatform.googleapis.com; provision_sa "$p"; done; }
+# 并行启用 API，再串行配置服务账号
+process_projects() {
+  local p pids=()
+  for p in "$@"; do
+    ( enable_services "$p" aiplatform.googleapis.com ) &
+    pids+=("$!")
+  done
+  # 等待全部启用完成
+  for pid in "${pids[@]}"; do wait "$pid"; done
+  # 再为每个项目处理 SA/密钥
+  for p in "$@"; do provision_sa "$p"; done
+}
 
 list_cloud_keys() { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
 latest_cloud_key() { gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)' | sed 's|.*/||'; }
@@ -93,7 +121,7 @@ provision_sa() {
   [[ -e "${local_keys[0]}" ]] || local_keys=()
 
   if (( ${#local_keys[@]} )); then
-    if ask_yes_no "[$proj] 本地密钥 (${#local_keys[@]})，生成新密钥?" Y; then
+    if ask_yes_no "[$proj] 本地已有密钥 (${#local_keys[@]}). 生成新密钥?" Y; then
       gen_key "$proj" "$sa"
       if ask_yes_no "[$proj] 删除云端旧密钥(保留最新)?" N; then
         local latest=$(latest_cloud_key "$sa")
@@ -108,35 +136,38 @@ provision_sa() {
   fi
 }
 
+show_status() {
+  printf "\n=== 当前项目状态 (Billing: %s) ===\n" "$BILLING_ACCOUNT"
+  local proj sa keycount api
+  for proj in "${PROJECTS[@]}"; do
+    sa="${SERVICE_ACCOUNT_NAME}@${proj}.iam.gserviceaccount.com"
+    keycount=$(ls -1 ${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-*.json 2>/dev/null | wc -l || true)
+    gcloud services list --enabled --project="$proj" --filter='aiplatform.googleapis.com' --format='value(config.name)' | grep -q . && api="ON" || api="OFF"
+    printf " • %-28s | Vertex API: %-3s | 本地密钥: %s\n" "$proj" "$api" "$keycount"
+  done
+  printf "============================================\n\n"
+}
+
 main() {
   check_env
   [[ $BILLING_ACCOUNT == 000000-AAAAAA-BBBBBB ]] && BILLING_ACCOUNT=$(auto_detect_billing)
   [[ -z $BILLING_ACCOUNT ]] && { log ERROR "未找到 OPEN 结算账户"; exit 1; }
-  log INFO "使用结算账户: $BILLING_ACCOUNT"
   prepare_key_dir
 
   mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
   local count=${#PROJECTS[@]}
-  log INFO "当前已绑定 $count / $MAX_PROJECTS_PER_ACCOUNT 项目"
+  log INFO "使用结算账户: $BILLING_ACCOUNT (已绑定 $count / $MAX_PROJECTS_PER_ACCOUNT 项目)"
 
   declare -a NEW_PROJECTS
+  show_status
 
-  if (( count >= MAX_PROJECTS_PER_ACCOUNT )); then
-    if ask_yes_no "在现有项目中启用 Vertex API 并处理密钥?" Y; then
-      process_existing_projects "${PROJECTS[@]}"
-    elif ask_yes_no "解绑并新建三个项目?" N; then
-      for p in "${PROJECTS[@]}"; do unlink_billing "$p"; done
-      PROJECTS=(); count=0
-    else
-      log INFO "无操作，结束脚本"; exit 0
-    fi
-  fi
-
-  while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
-
-  mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
-  log INFO "=== 结算账户现已绑定 ${#PROJECTS[@]} 项目 ==="
-  for p in "${PROJECTS[@]}"; do log INFO " - $p -> $(ls -1 ${KEY_DIR}/${p}-${SERVICE_ACCOUNT_NAME}-*.json | tail -1)"; done
-}
-
-main "$@"
+  case $(prompt_choice "请选择操作: 0) 仅查看状态  1) 新建/补足项目  2) 清空并重建  3) 退出" "0|1|2|3" "1") in
+    0)
+      log INFO "只读模式，脚本结束"; exit 0;;
+    1)
+      # 处理现有项目并补足(new)到 3
+      process_projects "${PROJECTS[@]}"
+      while (( count < MAX_PROJECTS_PER_ACCOUNT )); do create_project; ((count++)); done
+      ;;
+    2)
+      # 解绑全部 →
