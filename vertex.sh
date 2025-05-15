@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
-trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "${LINENO}" "$?" >&2'
+trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "${LINENO}" "$?" >&2' ERR
 
 BILLING_ACCOUNT="000000-AAAAAA-BBBBBB"
 PROJECT_PREFIX="vertex"
