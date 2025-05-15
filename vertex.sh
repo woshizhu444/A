@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
-# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r5)
+# Google Cloud | Vertex AI auto‑provision helper (v2025‑05‑15‑r6)
 # Creates/rotates up to three Vertex‑ready projects under one billing account.
 
 set -Eeuo pipefail
-trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "${LINENO}" "$?" >&2' ERR
+trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "${LINENO}" "$?" >&2'
 
-# ---- Config -----------------------------------------------------------------
+# Config ---------------------------------------------------------------------
 BILLING_ACCOUNT="000000-AAAAAA-BBBBBB"   # auto‑detect if left default
-PROJECT_PREFIX="vertex"                  # new project id prefix
+PROJECT_PREFIX="vertex"                  # project id prefix
 MAX_PROJECTS_PER_ACCOUNT=3
-SERVICE_ACCOUNT_NAME="vertex-admin"      # base service account name
-KEY_DIR="./keys"                         # local key store (one JSON per key)
-MAX_RETRY=3                               # gcloud retry attempts
+SERVICE_ACCOUNT_NAME="vertex-admin"
+KEY_DIR="./keys"
+MAX_RETRY=3
 ENABLE_EXTRA_ROLES=(roles/iam.serviceAccountUser roles/aiplatform.user)
-# -----------------------------------------------------------------------------
 
-log()          { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
+log() { printf '[%(%F %T)T] [%s] %s\n' -1 "${1:-INFO}" "${2:-}" >&2; }
+
 retry() {
   local n=1 delay
   until "$@"; do
     (( n >= MAX_RETRY )) && { log ERROR "失败: $*"; return 1; }
-    delay=$(( n * 10 + RANDOM % 5 ))
+    delay=$(( n*10 + RANDOM%5 ))
     log WARN "重试 $n/$MAX_RETRY: $* (等待 ${delay}s)"
     sleep "$delay"
     (( n++ ))
   done
 }
-require_cmd()  { command -v "$1" &>/dev/null || { log ERROR "缺少依赖: $1"; exit 1; }; }
-ask_yes_no()   { local p="$1" d=${2:-N} r; [[ -t 0 ]] && read -r -p "$p [${d}] " r; r=${r:-$d}; [[ $r =~ ^[Yy]$ ]]; }
+
+require_cmd() { command -v "$1" &>/dev/null || { log ERROR "缺少依赖: $1"; exit 1; }; }
+ask_yes_no() { local p="$1" d=${2:-N} r; [[ -t 0 ]] && read -r -p "$p [${d}] " r; r=${r:-$d}; [[ $r =~ ^[Yy]$ ]]; }
 
 check_env() {
   require_cmd gcloud
   gcloud config list account --quiet &>/dev/null || { log ERROR "请先运行 gcloud init"; exit 1; }
-  gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q . || { log ERROR "请先 gcloud auth login"; exit 1; }
+  gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q . || { log ERROR "请先 gcloud auth login"; exit 1; }
 }
 
 auto_detect_billing() {
@@ -47,7 +48,6 @@ new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 enable_services() {
   local p=$1 svc; shift
   for svc in "$@"; do
-    # 跳过已启用服务，减少 Service Usage 429
     gcloud services list --enabled --project="$p" --filter="$svc" --format='value(config.name)' | grep -q . && continue
     retry gcloud services enable "$svc" --project="$p" --quiet
   done
@@ -68,7 +68,6 @@ create_project() {
 
 process_existing_projects() { for p in "$@"; do enable_services "$p" aiplatform.googleapis.com; provision_sa "$p"; done; }
 
-# ----- SA helpers ------------------------------------------------------------
 list_cloud_keys() { gcloud iam service-accounts keys list --iam-account="$1" --format='value(name)' | sed 's|.*/||'; }
 latest_cloud_key() { gcloud iam service-accounts keys list --iam-account="$1" --limit=1 --sort-by=~createTime --format='value(name)' | sed 's|.*/||'; }
 
@@ -84,22 +83,19 @@ provision_sa() {
   local proj=$1
   local sa="${SERVICE_ACCOUNT_NAME}@${proj}.iam.gserviceaccount.com"
 
-  # create SA if missing
   gcloud iam service-accounts describe "$sa" --project "$proj" &>/dev/null || \
     retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Admin" --project "$proj" --quiet
 
-  # ensure roles
   local roles=(roles/aiplatform.admin "${ENABLE_EXTRA_ROLES[@]}")
   for r in "${roles[@]}"; do retry gcloud projects add-iam-policy-binding "$proj" --member="serviceAccount:$sa" --role="$r" --quiet || true; done
 
-  # check existing local keys for this SA
   local local_keys=("${KEY_DIR}/${proj}-${SERVICE_ACCOUNT_NAME}-"*.json)
   [[ -e "${local_keys[0]}" ]] || local_keys=()
 
   if (( ${#local_keys[@]} )); then
-    if ask_yes_no "[$proj] 检测到本地密钥 (${#local_keys[@]})，是否为服务账号生成<新>密钥?" Y; then
+    if ask_yes_no "[$proj] 本地密钥 (${#local_keys[@]})，生成新密钥?" Y; then
       gen_key "$proj" "$sa"
-      if ask_yes_no "[$proj] 是否删除 <云端> 旧密钥(保留最新一把)?" N; then
+      if ask_yes_no "[$proj] 删除云端旧密钥(保留最新)?" N; then
         local latest=$(latest_cloud_key "$sa")
         mapfile -t key_ids < <(list_cloud_keys "$sa")
         for k in "${key_ids[@]}"; do [[ $k == "$latest" ]] && continue; retry gcloud iam service-accounts keys delete "$k" --iam-account="$sa" --quiet; log INFO "[$proj] 删除云端旧密钥 $k"; done
@@ -112,7 +108,6 @@ provision_sa() {
   fi
 }
 
-# ----- Main ------------------------------------------------------------------
 main() {
   check_env
   [[ $BILLING_ACCOUNT == 000000-AAAAAA-BBBBBB ]] && BILLING_ACCOUNT=$(auto_detect_billing)
