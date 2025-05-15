@@ -4,9 +4,9 @@ set -Eeuo pipefail
 trap 'printf "[ERROR] aborted at line %d (exit %d)\n" "$LINENO" "$?" >&2' ERR
 
 # ────────────────────────────────────────────
-# Config (可用环境变量覆盖)
+# Config (env‑overridable)
 # ────────────────────────────────────────────
-BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}"  # 默认占位符 → 自动选择
+BILLING_ACCOUNT="${BILLING_ACCOUNT:-000000-AAAAAA-BBBBBB}"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
@@ -61,12 +61,8 @@ choose_billing() {
     BILLING_ACCOUNT="${ACCS[0]%% *}"
     return
   fi
-
-  printf "可用结算账户：
-"
-  local i; for i in "${!ACCS[@]}"; do printf "  %d) %s
-" "$i" "${ACCS[$i]}"; done
-
+  printf "可用结算账户：\n"
+  local i; for i in "${!ACCS[@]}"; do printf "  %d) %s\n" "$i" "${ACCS[$i]}"; done
   local sel
   while true; do
     read -r -p "请输入编号 [0-$((${#ACCS[@]}-1))] (默认 0): " sel
@@ -75,15 +71,15 @@ choose_billing() {
     echo "无效输入，请重新输入数字。"
   done
   BILLING_ACCOUNT="${ACCS[$sel]%% *}"
-}  # choose_billing
+}
 
 prepare_key_dir() { mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"; }
 unique_suffix() { date +%s%N | sha256sum | head -c6; }
-new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }() { date +%s%N | sha256sum | head -c6; }
 new_project_id() { echo "${PROJECT_PREFIX}-$(unique_suffix)"; }
 
 enable_services() {
-  local proj=$1; shift; local svc
+  local proj=$1; shift
+  local svc
   for svc in "$@"; do
     gcloud services list --enabled --project="$proj" --filter="$svc" --format='value(config.name)' | grep -q . && continue
     retry gcloud services enable "$svc" --project="$proj" --quiet
@@ -104,7 +100,8 @@ create_project() {
 }
 
 process_projects() {
-  local p pid_arr=(); for p in "$@"; do ( enable_services "$p" aiplatform.googleapis.com ) & pid_arr+=("$!"); done
+  local p pid_arr=()
+  for p in "$@"; do ( enable_services "$p" aiplatform.googleapis.com ) & pid_arr+=("$!"); done
   for pid in "${pid_arr[@]}"; do wait "$pid"; done
   for p in "$@"; do provision_sa "$p"; done
 }
@@ -166,11 +163,7 @@ main() {
 
   while true; do
     show_status
-    case $(prompt_choice $'请选择操作：
- 0) 仅查看状态
- 1) 新建/补足项目
- 2) 清空并重建
- 3) 退出' "0|1|2|3" "1") in
+    case $(prompt_choice $'请选择操作：\n 0) 仅查看状态\n 1) 新建/补足项目\n 2) 清空并重建\n 3) 退出' "0|1|2|3" "1") in
       0) continue ;;
       1)
         process_projects "${PROJECTS[@]}"
