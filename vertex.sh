@@ -149,7 +149,7 @@ show_status() {
 
 main() {
   check_env
-  [[ $BILLING_ACCOUNT == 000000-AAAAAA-BBBBBB ]] && choose_billing
+  choose_billing
   prepare_key_dir
   mapfile -t PROJECTS < <(gcloud beta billing projects list --billing-account="$BILLING_ACCOUNT" --format='value(projectId)')
   local count=${#PROJECTS[@]}
@@ -158,7 +158,11 @@ main() {
 
   while true; do
     show_status
-    case $(prompt_choice $'请选择操作：\n 0) 仅查看状态\n 1) 新建/补足项目\n 2) 清空并重建\n 3) 退出' "0|1|2|3" "1") in
+    case $(prompt_choice $'请选择操作：
+ 0) 仅查看状态
+ 1) 新建/补足项目
+ 2) 清空并重建
+ 3) 退出' "0|1|2|3" "1") in
       0) continue ;;
       1)
         process_projects "${PROJECTS[@]}"
